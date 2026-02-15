@@ -1,0 +1,5 @@
+repos:
+  - name: simonvanlaak/CyberneticAgents
+    owner_logins: [simonvanlaak]
+  - name: simonvanlaak/GhIssueWorkflow
+    owner_logins: [simonvanlaak]
