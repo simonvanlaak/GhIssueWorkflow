@@ -28,6 +28,10 @@ class GhClient:
         args = ["gh", "api", "--method", "PATCH", path]
         return self._run_json(args, stdin_json=body)
 
+    def api_post_json(self, path: str, body: dict[str, Any]) -> Any:
+        args = ["gh", "api", "--method", "POST", path]
+        return self._run_json(args, stdin_json=body)
+
     def _run_json(self, args: list[str], *, stdin_json: dict[str, Any] | None = None) -> Any:
         if self.dry_run and any(flag in args for flag in ["POST", "PATCH", "PUT", "DELETE"]):
             return {"dry_run": True, "args": args, "body": stdin_json}
