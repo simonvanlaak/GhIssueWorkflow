@@ -10,7 +10,9 @@ class FakeClient:
     def __init__(self) -> None:
         self.calls: list[tuple[str, str, dict[str, Any] | None]] = []
 
-    def api(self, method: str, path: str, *, fields: dict[str, Any] | None = None) -> Any:
+    def api(
+        self, method: str, path: str, *, fields: dict[str, Any] | None = None
+    ) -> Any:
         self.calls.append((method, path, fields))
 
         if path.endswith("/labels") and method == "GET":
@@ -20,21 +22,20 @@ class FakeClient:
             return []
 
         if path.startswith("repos/") and path.endswith("/issues") and method == "GET":
-            return []
-
-        if path == "search/issues":
-            query = (fields or {}).get("q", "")
-            if "is:closed" in query:
-                return {"items": []}
-            return {
-                "items": [
+            state = (fields or {}).get("state")
+            if state == "closed":
+                return []
+            if state == "open":
+                return [
                     {
                         "number": 10,
                         "created_at": "2026-02-10T00:00:00Z",
-                        "labels": [{"name": "stage:backlog"}],
+                        "labels": [{"name": "stage:queued"}],
                     }
                 ]
-            }
+            if state == "all":
+                return []
+            return []
 
         if path.endswith("/issues/10/events"):
             return [
@@ -46,7 +47,7 @@ class FakeClient:
             ]
 
         if path.endswith("/issues/10"):
-            return {"labels": [{"name": "stage:backlog"}]}
+            return {"labels": [{"name": "stage:queued"}]}
 
         return {}
 
@@ -65,7 +66,9 @@ class FakeCodeScanningClient:
         self.created_labels: list[dict[str, Any]] = []
         self.created_issues: list[dict[str, Any]] = []
 
-    def api(self, method: str, path: str, *, fields: dict[str, Any] | None = None) -> Any:
+    def api(
+        self, method: str, path: str, *, fields: dict[str, Any] | None = None
+    ) -> Any:
         if path.endswith("/labels") and method == "GET":
             return [
                 {"name": "stage:queued"},
@@ -114,7 +117,7 @@ class FakeCodeScanningClient:
         raise AssertionError(f"Unexpected POST JSON call: {path} {body}")
 
 
-def test_run_tick_moves_backlog_to_needs_clarification() -> None:
+def test_run_tick_moves_queued_to_needs_clarification_without_search_api() -> None:
     fake = FakeClient()
     wf = Workflow(fake)  # type: ignore[arg-type]
     result = wf.run_tick(RepoConfig(name="acme/repo", owner_logins=["simonvanlaak"]))
@@ -125,6 +128,7 @@ def test_run_tick_moves_backlog_to_needs_clarification() -> None:
     patch_calls = [c for c in fake.calls if c[0] == "PATCH"]
     assert patch_calls
     assert patch_calls[-1][2] == {"labels": ["stage:needs-clarification"]}
+    assert all(path != "search/issues" for _, path, _ in fake.calls)
 
 
 def test_sync_code_scanning_alerts_creates_issue_with_labels() -> None:
@@ -164,7 +168,9 @@ class FakeClosedSecurityIssueClient:
         self.alert_state = alert_state
         self.dismiss_calls: list[tuple[str, dict[str, Any]]] = []
 
-    def api(self, method: str, path: str, *, fields: dict[str, Any] | None = None) -> Any:
+    def api(
+        self, method: str, path: str, *, fields: dict[str, Any] | None = None
+    ) -> Any:
         if path.endswith("/issues") and method == "GET":
             state = (fields or {}).get("state")
             labels = (fields or {}).get("labels")

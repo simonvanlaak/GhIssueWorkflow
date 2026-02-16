@@ -8,9 +8,9 @@ from gh_issue_workflow.config import RepoConfig
 from gh_issue_workflow.gh_client import GhApiError, GhClient
 from gh_issue_workflow.stages import (
     KNOWN_STAGE_LABELS,
-    STAGE_BACKLOG,
     STAGE_IN_PROGRESS,
     STAGE_NEEDS_CLARIFICATION,
+    STAGE_QUEUED,
     STAGE_READY_TO_IMPLEMENT,
     apply_stage_label,
     pick_next_issue,
@@ -18,6 +18,7 @@ from gh_issue_workflow.stages import (
 
 STAGE_COLORS = {
     "stage:backlog": "cfd3d7",
+    "stage:queued": "bfd4f2",
     "stage:needs-clarification": "fbca04",
     "stage:ready-to-implement": "0e8a16",
     "stage:in-progress": "1d76db",
@@ -25,7 +26,7 @@ STAGE_COLORS = {
     "stage:blocked": "d93f0b",
 }
 
-SECURITY_STAGE_QUEUED = "stage:queued"
+SECURITY_STAGE_QUEUED = STAGE_QUEUED
 SECURITY_LABEL = "security"
 SEVERITY_PREFIX = "severity:"
 
@@ -60,7 +61,9 @@ class Workflow:
 
     def _list_repo_labels(self, repo: str) -> set[str]:
         owner, repo_name = self._split_repo(repo)
-        rows = self.client.api("GET", f"repos/{owner}/{repo_name}/labels", fields={"per_page": 100})
+        rows = self.client.api(
+            "GET", f"repos/{owner}/{repo_name}/labels", fields={"per_page": 100}
+        )
         if not isinstance(rows, list):
             return set()
 
@@ -78,7 +81,9 @@ class Workflow:
             fields={"name": name, "color": color, "description": description},
         )
 
-    def _ensure_labels_exist(self, repo: str, existing: set[str], labels: Iterable[str]) -> None:
+    def _ensure_labels_exist(
+        self, repo: str, existing: set[str], labels: Iterable[str]
+    ) -> None:
         for label in labels:
             if label in existing:
                 continue
@@ -101,33 +106,81 @@ class Workflow:
         for label in sorted(KNOWN_STAGE_LABELS):
             if label in existing:
                 continue
-            self._create_label(repo, label, STAGE_COLORS[label], "automation stage label")
+            self._create_label(
+                repo, label, STAGE_COLORS[label], "automation stage label"
+            )
 
     def cleanup_closed_issue_stage_labels(self, repo: str) -> int:
+        owner, repo_name = self._split_repo(repo)
+        issues = self.client.api(
+            "GET",
+            f"repos/{owner}/{repo_name}/issues",
+            fields={"state": "closed", "per_page": 100},
+        )
+
+        if not isinstance(issues, list):
+            return 0
+
         cleaned = 0
-        for stage_label in sorted(KNOWN_STAGE_LABELS):
-            q = f'repo:{repo} is:issue is:closed label:"{stage_label}"'
-            result = self.client.api("GET", "search/issues", fields={"q": q, "per_page": 100})
-            for issue in result.get("items", []):
-                self.set_status(repo, int(issue["number"]), None)
+        for issue in issues:
+            if not isinstance(issue, dict) or issue.get("pull_request"):
+                continue
+
+            labels_raw = issue.get("labels", [])
+            labels = [
+                label.get("name") for label in labels_raw if isinstance(label, dict)
+            ]
+            if not any(
+                isinstance(label, str) and label.startswith("stage:")
+                for label in labels
+            ):
+                continue
+
+            number = issue.get("number")
+            if isinstance(number, int):
+                self.set_status(repo, number, None)
                 cleaned += 1
+
         return cleaned
 
     def list_open_issues(self, repo: str) -> list[dict[str, Any]]:
-        q = f"repo:{repo} is:issue is:open"
-        data = self.client.api("GET", "search/issues", fields={"q": q, "per_page": 100})
+        owner, repo_name = self._split_repo(repo)
+        issues = self.client.api(
+            "GET",
+            f"repos/{owner}/{repo_name}/issues",
+            fields={"state": "open", "per_page": 100},
+        )
+
+        if not isinstance(issues, list):
+            return []
+
         out: list[dict[str, Any]] = []
-        for issue in data.get("items", []):
+        for issue in issues:
+            if not isinstance(issue, dict) or issue.get("pull_request"):
+                continue
+
+            number = issue.get("number")
+            created_at = issue.get("created_at")
+            labels = issue.get("labels", [])
+            if not isinstance(number, int) or not isinstance(created_at, str):
+                continue
+
             out.append(
                 {
-                    "number": int(issue["number"]),
-                    "created_at": issue["created_at"],
-                    "labels": [lab["name"] for lab in issue.get("labels", [])],
+                    "number": number,
+                    "created_at": created_at,
+                    "labels": [
+                        lab.get("name")
+                        for lab in labels
+                        if isinstance(lab, dict) and isinstance(lab.get("name"), str)
+                    ],
                 }
             )
         return out
 
-    def is_ready_authorized(self, repo: str, issue_number: int, owner_logins: list[str]) -> bool:
+    def is_ready_authorized(
+        self, repo: str, issue_number: int, owner_logins: list[str]
+    ) -> bool:
         owner, repo_name = self._split_repo(repo)
         events = self.client.api(
             "GET",
@@ -150,7 +203,9 @@ class Workflow:
             int(i["number"])
             for i in issues
             if STAGE_READY_TO_IMPLEMENT in set(i.get("labels", []))
-            and self.is_ready_authorized(repo_cfg.name, int(i["number"]), repo_cfg.owner_logins)
+            and self.is_ready_authorized(
+                repo_cfg.name, int(i["number"]), repo_cfg.owner_logins
+            )
         }
         pick = pick_next_issue(issues, authorized_ready_issue_numbers=authorized_ready)
         if pick is None:
@@ -159,13 +214,20 @@ class Workflow:
 
     def set_status(self, repo: str, issue_number: int, new_status: str | None) -> None:
         owner, repo_name = self._split_repo(repo)
-        issue = self.client.api("GET", f"repos/{owner}/{repo_name}/issues/{issue_number}")
+        issue = self.client.api(
+            "GET", f"repos/{owner}/{repo_name}/issues/{issue_number}"
+        )
         existing = [label["name"] for label in issue.get("labels", [])]
         if new_status is None:
-            target_labels = sorted([label for label in existing if not label.startswith("stage:")])
+            target_labels = sorted(
+                [label for label in existing if not label.startswith("stage:")]
+            )
         else:
             target_labels = sorted(apply_stage_label(existing, new_status))
-        self.client.api_patch_json(f"repos/{owner}/{repo_name}/issues/{issue_number}", {"labels": target_labels})
+        self.client.api_patch_json(
+            f"repos/{owner}/{repo_name}/issues/{issue_number}",
+            {"labels": target_labels},
+        )
 
     def post_comment(self, repo: str, issue_number: int, body: str) -> None:
         owner, repo_name = self._split_repo(repo)
@@ -199,7 +261,9 @@ class Workflow:
     @staticmethod
     def _severity_from_alert(alert: dict[str, Any]) -> str:
         rule = alert.get("rule") if isinstance(alert.get("rule"), dict) else {}
-        severity_raw = rule.get("security_severity_level") or rule.get("severity") or "unknown"
+        severity_raw = (
+            rule.get("security_severity_level") or rule.get("severity") or "unknown"
+        )
         severity = str(severity_raw).strip().lower() or "unknown"
         return severity
 
@@ -209,7 +273,11 @@ class Workflow:
         rule_id = str(rule.get("id") or "").strip()
         description = str(rule.get("description") or "").strip()
 
-        headline = rule_id or description or f"code-scanning-alert-{alert.get('number', 'unknown')}"
+        headline = (
+            rule_id
+            or description
+            or f"code-scanning-alert-{alert.get('number', 'unknown')}"
+        )
         return f"security: {headline}"
 
     @staticmethod
@@ -256,7 +324,9 @@ class Workflow:
         )
 
     @staticmethod
-    def _extract_alert_number_from_body(body: str, *, owner: str, repo_name: str) -> int | None:
+    def _extract_alert_number_from_body(
+        body: str, *, owner: str, repo_name: str
+    ) -> int | None:
         for match in ALERT_URL_RE.finditer(body):
             if match.group("owner") != owner or match.group("repo") != repo_name:
                 continue
@@ -275,7 +345,11 @@ class Workflow:
             f"repos/{owner}/{repo_name}/issues",
             fields={"state": "closed", "labels": SECURITY_LABEL, "per_page": 100},
         )
-        issues = [item for item in issues_payload if isinstance(item, dict)] if isinstance(issues_payload, list) else []
+        issues = (
+            [item for item in issues_payload if isinstance(item, dict)]
+            if isinstance(issues_payload, list)
+            else []
+        )
 
         dismissed = 0
         already_resolved = 0
@@ -290,12 +364,16 @@ class Workflow:
                 missing_link += 1
                 continue
 
-            alert_number = self._extract_alert_number_from_body(body, owner=owner, repo_name=repo_name)
+            alert_number = self._extract_alert_number_from_body(
+                body, owner=owner, repo_name=repo_name
+            )
             if alert_number is None:
                 missing_link += 1
                 continue
 
-            alert_path = f"repos/{owner}/{repo_name}/code-scanning/alerts/{alert_number}"
+            alert_path = (
+                f"repos/{owner}/{repo_name}/code-scanning/alerts/{alert_number}"
+            )
             try:
                 alert = self.client.api("GET", alert_path)
             except GhApiError as error:
@@ -333,7 +411,11 @@ class Workflow:
             f"repos/{owner}/{repo_name}/code-scanning/alerts",
             fields={"state": "open", "per_page": 100},
         )
-        alerts = [alert for alert in alerts_payload if isinstance(alert, dict)] if isinstance(alerts_payload, list) else []
+        alerts = (
+            [alert for alert in alerts_payload if isinstance(alert, dict)]
+            if isinstance(alerts_payload, list)
+            else []
+        )
 
         existing_bodies = self._list_issue_bodies(repo)
         existing_labels = self._list_repo_labels(repo)
@@ -356,7 +438,9 @@ class Workflow:
                 "body": self._build_alert_issue_body(alert),
                 "labels": issue_labels,
             }
-            self.client.api_post_json(f"repos/{owner}/{repo_name}/issues", issue_payload)
+            self.client.api_post_json(
+                f"repos/{owner}/{repo_name}/issues", issue_payload
+            )
             existing_bodies.append(issue_payload["body"])
             created += 1
 
@@ -375,7 +459,9 @@ class Workflow:
             "security_created": security_sync["created"],
             "security_skipped_existing": security_sync["skipped_existing"],
             "security_closed_dismissed": closed_security_sync["dismissed"],
-            "security_closed_already_resolved": closed_security_sync["already_resolved"],
+            "security_closed_already_resolved": closed_security_sync[
+                "already_resolved"
+            ],
             "security_closed_missing_link": closed_security_sync["missing_link"],
         }
 
@@ -385,7 +471,7 @@ class Workflow:
         number = int(pick["number"])
         stage = str(pick["picked_from_stage"])
 
-        if stage == STAGE_BACKLOG:
+        if stage == STAGE_QUEUED:
             self.set_status(repo_cfg.name, number, STAGE_NEEDS_CLARIFICATION)
             return {**base, "action": "moved-to-needs-clarification", "issue": number}
 
