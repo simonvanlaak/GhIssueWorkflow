@@ -157,3 +157,82 @@ def test_sync_code_scanning_alerts_dedupes_by_alert_url() -> None:
 
     assert result == {"created": 0, "skipped_existing": 1}
     assert fake.created_issues == []
+
+
+class FakeClosedSecurityIssueClient:
+    def __init__(self, *, alert_state: str = "open") -> None:
+        self.alert_state = alert_state
+        self.dismiss_calls: list[tuple[str, dict[str, Any]]] = []
+
+    def api(self, method: str, path: str, *, fields: dict[str, Any] | None = None) -> Any:
+        if path.endswith("/issues") and method == "GET":
+            state = (fields or {}).get("state")
+            labels = (fields or {}).get("labels")
+            if state == "all":
+                return []
+            if state == "closed" and labels == "security":
+                return [
+                    {
+                        "number": 15,
+                        "body": "Auto-created from GitHub Advanced Security code scanning alert.\n"
+                        "- Alert URL: https://github.com/acme/repo/security/code-scanning/2\n",
+                    }
+                ]
+            return []
+
+        if path.endswith("/labels") and method == "GET":
+            return []
+
+        if path.endswith("/code-scanning/alerts") and method == "GET":
+            return []
+
+        if path.endswith("/code-scanning/alerts/2") and method == "GET":
+            return {"number": 2, "state": self.alert_state}
+
+        if path == "search/issues":
+            query = (fields or {}).get("q", "")
+            if "is:closed" in query:
+                return {"items": []}
+            return {"items": []}
+
+        raise AssertionError(f"Unexpected API call: {method} {path} {fields}")
+
+    def api_patch_json(self, path: str, body: dict[str, Any]) -> Any:
+        if path.endswith("/code-scanning/alerts/2"):
+            self.dismiss_calls.append((path, body))
+            return {}
+        if path.endswith("/issues/15"):
+            return {}
+        raise AssertionError(f"Unexpected PATCH call: {path} {body}")
+
+    def api_post_json(self, path: str, body: dict[str, Any]) -> Any:
+        raise AssertionError(f"Unexpected POST JSON call: {path} {body}")
+
+
+def test_sync_closed_security_issues_dismisses_open_alert() -> None:
+    fake = FakeClosedSecurityIssueClient(alert_state="open")
+    wf = Workflow(fake)  # type: ignore[arg-type]
+
+    result = wf.sync_closed_security_issues("acme/repo")
+
+    assert result == {"dismissed": 1, "already_resolved": 0, "missing_link": 0}
+    assert fake.dismiss_calls == [
+        (
+            "repos/acme/repo/code-scanning/alerts/2",
+            {
+                "state": "dismissed",
+                "dismissed_reason": "false positive",
+                "dismissed_comment": "Auto-dismissed: linked tracking issue #15 was closed.",
+            },
+        )
+    ]
+
+
+def test_sync_closed_security_issues_skips_already_resolved_alert() -> None:
+    fake = FakeClosedSecurityIssueClient(alert_state="dismissed")
+    wf = Workflow(fake)  # type: ignore[arg-type]
+
+    result = wf.sync_closed_security_issues("acme/repo")
+
+    assert result == {"dismissed": 0, "already_resolved": 1, "missing_link": 0}
+    assert fake.dismiss_calls == []

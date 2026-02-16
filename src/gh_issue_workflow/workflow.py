@@ -1,10 +1,11 @@
 from __future__ import annotations
 
+import re
 from dataclasses import asdict
 from typing import Any, Iterable
 
 from gh_issue_workflow.config import RepoConfig
-from gh_issue_workflow.gh_client import GhClient
+from gh_issue_workflow.gh_client import GhApiError, GhClient
 from gh_issue_workflow.stages import (
     KNOWN_STAGE_LABELS,
     STAGE_BACKLOG,
@@ -43,6 +44,10 @@ SEVERITY_COLORS: dict[str, str] = {
     "note": "1d76db",
     "unknown": "cfd3d7",
 }
+
+ALERT_URL_RE = re.compile(
+    r"https://github\.com/(?P<owner>[^/]+)/(?P<repo>[^/]+)/security/code-scanning/(?P<alert_number>\d+)"
+)
 
 
 class Workflow:
@@ -250,6 +255,77 @@ class Workflow:
             f"- Affected file(s): {location}\n"
         )
 
+    @staticmethod
+    def _extract_alert_number_from_body(body: str, *, owner: str, repo_name: str) -> int | None:
+        for match in ALERT_URL_RE.finditer(body):
+            if match.group("owner") != owner or match.group("repo") != repo_name:
+                continue
+            return int(match.group("alert_number"))
+        return None
+
+    @staticmethod
+    def _is_not_found(error: GhApiError) -> bool:
+        message = str(error).lower()
+        return "404" in message or "not found" in message
+
+    def sync_closed_security_issues(self, repo: str) -> dict[str, int]:
+        owner, repo_name = self._split_repo(repo)
+        issues_payload = self.client.api(
+            "GET",
+            f"repos/{owner}/{repo_name}/issues",
+            fields={"state": "closed", "labels": SECURITY_LABEL, "per_page": 100},
+        )
+        issues = [item for item in issues_payload if isinstance(item, dict)] if isinstance(issues_payload, list) else []
+
+        dismissed = 0
+        already_resolved = 0
+        missing_link = 0
+
+        for issue in issues:
+            if issue.get("pull_request"):
+                continue
+
+            body = issue.get("body")
+            if not isinstance(body, str) or not body.strip():
+                missing_link += 1
+                continue
+
+            alert_number = self._extract_alert_number_from_body(body, owner=owner, repo_name=repo_name)
+            if alert_number is None:
+                missing_link += 1
+                continue
+
+            alert_path = f"repos/{owner}/{repo_name}/code-scanning/alerts/{alert_number}"
+            try:
+                alert = self.client.api("GET", alert_path)
+            except GhApiError as error:
+                if self._is_not_found(error):
+                    already_resolved += 1
+                    continue
+                raise
+
+            state = str(alert.get("state") or "").strip().lower()
+            if state != "open":
+                already_resolved += 1
+                continue
+
+            issue_number = int(issue.get("number", 0))
+            self.client.api_patch_json(
+                alert_path,
+                {
+                    "state": "dismissed",
+                    "dismissed_reason": "false positive",
+                    "dismissed_comment": f"Auto-dismissed: linked tracking issue #{issue_number} was closed.",
+                },
+            )
+            dismissed += 1
+
+        return {
+            "dismissed": dismissed,
+            "already_resolved": already_resolved,
+            "missing_link": missing_link,
+        }
+
     def sync_code_scanning_alerts(self, repo: str) -> dict[str, int]:
         owner, repo_name = self._split_repo(repo)
         alerts_payload = self.client.api(
@@ -289,6 +365,7 @@ class Workflow:
     def run_tick(self, repo_cfg: RepoConfig) -> dict[str, Any]:
         self.ensure_stage_labels(repo_cfg.name)
         security_sync = self.sync_code_scanning_alerts(repo_cfg.name)
+        closed_security_sync = self.sync_closed_security_issues(repo_cfg.name)
         cleaned = self.cleanup_closed_issue_stage_labels(repo_cfg.name)
         pick = self.pick_next(repo_cfg)
 
@@ -297,6 +374,9 @@ class Workflow:
             "cleaned_closed": cleaned,
             "security_created": security_sync["created"],
             "security_skipped_existing": security_sync["skipped_existing"],
+            "security_closed_dismissed": closed_security_sync["dismissed"],
+            "security_closed_already_resolved": closed_security_sync["already_resolved"],
+            "security_closed_missing_link": closed_security_sync["missing_link"],
         }
 
         if not pick:
